@@ -8,32 +8,30 @@ import (
 // DelayMap is a generic map that allows setting and retrieving values with a timeout mechanism.
 // If a value for a key is not immediately available, it waits for the specified timeout duration before returning.
 type DelayMap[K comparable, V any] struct {
-	data        map[K]V             // Internal map for storing key-value pairs.
-	waitTimeout time.Duration       // Maximum time to wait for a key to be set.
-	waitChans   map[K]chan struct{} // Channels to signal when a value becomes available for a key.
-	mu          sync.Mutex          // Mutex to protect concurrent access.
+	data        map[K]V          // Internal map for storing key-value pairs.
+	waitTimeout time.Duration    // Maximum time to wait for a key to be set.
+	conds       map[K]*sync.Cond // Condition variables for waiting goroutines.
+	mu          sync.Mutex       // Mutex to protect concurrent access.
 }
 
 // New creates a new DelayMap with the specified wait timeout.
 func New[K comparable, V any](waitTimeout time.Duration) *DelayMap[K, V] {
-	m := &DelayMap[K, V]{
+	return &DelayMap[K, V]{
 		data:        make(map[K]V),
 		waitTimeout: waitTimeout,
-		waitChans:   make(map[K]chan struct{}),
+		conds:       make(map[K]*sync.Cond),
 	}
-	return m
 }
 
 // Set assigns a value to the given key and signals any waiting goroutines.
 func (dm *DelayMap[K, V]) Set(key K, value V) {
 	dm.mu.Lock()
-	defer dm.mu.Unlock()
-
 	dm.data[key] = value
-	if ch, exists := dm.waitChans[key]; exists {
-		close(ch) // Signal waiting goroutines.
-		delete(dm.waitChans, key)
+	if cond, exists := dm.conds[key]; exists {
+		cond.Broadcast() // Wake up all waiting goroutines.
+		delete(dm.conds, key)
 	}
+	dm.mu.Unlock()
 }
 
 // Get retrieves the value for the given key. If the value is not available, it waits for the specified timeout.
@@ -44,19 +42,34 @@ func (dm *DelayMap[K, V]) Get(key K) (V, bool) {
 		dm.mu.Unlock()
 		return val, true
 	}
-	ch := make(chan struct{})
-	dm.waitChans[key] = ch
+
+	// Create a new sync.Cond if it does not exist.
+	cond, exists := dm.conds[key]
+	if !exists {
+		cond = sync.NewCond(&dm.mu)
+		dm.conds[key] = cond
+	}
 	dm.mu.Unlock()
 
+	// Wait for the value to be set or timeout.
+	timeout := time.After(dm.waitTimeout)
+	done := make(chan struct{}) // Channel for synchronization.
+
+	go func() {
+		dm.mu.Lock()
+		defer dm.mu.Unlock()
+		cond.Wait() // Wait for a signal from Set.
+		close(done)
+	}()
+
 	select {
-	case <-ch:
+	case <-done:
 		dm.mu.Lock()
 		val, exists := dm.data[key]
 		dm.mu.Unlock()
 		return val, exists
-	case <-time.After(dm.waitTimeout):
+	case <-timeout:
 		dm.mu.Lock()
-		delete(dm.waitChans, key) // Clean up wait channel.
 		dm.mu.Unlock()
 		var zero V
 		return zero, false
@@ -70,15 +83,15 @@ func (dm *DelayMap[K, V]) Delete(key K) {
 	dm.mu.Unlock()
 }
 
-// Close clears the map and ends all pending expectations by closing all wait channels.
+// Close clears the map and ends all pending expectations by broadcasting all wait conditions.
 func (dm *DelayMap[K, V]) Close() {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
-	for key, ch := range dm.waitChans {
-		close(ch) // Notify all waiting goroutines.
-		delete(dm.waitChans, key)
+	for key, cond := range dm.conds {
+		cond.Broadcast() // Notify all waiting goroutines.
+		delete(dm.conds, key)
 	}
-	dm.data = make(map[K]V)                  // Reset the map.
-	dm.waitChans = make(map[K]chan struct{}) // Reset the wait channels.
+	dm.data = make(map[K]V)           // Reset the map.
+	dm.conds = make(map[K]*sync.Cond) // Reset the condition variables.
 }

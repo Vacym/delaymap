@@ -1,6 +1,7 @@
 package delaymap_test
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -125,5 +126,110 @@ func TestDelayMap_Delete(t *testing.T) {
 	val, exists := dm.Get("key1")
 	if exists || val != 0 {
 		t.Errorf("expected value 0, got %v", val)
+	}
+}
+
+func TestDelayMap_GetWithTimeoutRepeat(t *testing.T) {
+	dm := delaymap.New[string, int](time.Millisecond * 100)
+
+	var wg sync.WaitGroup
+
+	go func() {
+		time.Sleep(time.Millisecond * 50)
+		dm.Set("key1", 10)
+	}()
+
+	tests := 5
+	wg.Add(tests)
+
+	for i := 0; i < tests; i++ {
+		go func() {
+			defer wg.Done()
+			val, exists := dm.Get("key1")
+			if !exists || val != 10 {
+				t.Errorf("expected value 10, got %v", val)
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+func TestDelayMap_GetWithTimeoutPartiallyGot(t *testing.T) {
+	dm := delaymap.New[string, int](time.Millisecond * 50)
+
+	var wg sync.WaitGroup
+
+	go func() {
+		time.Sleep(time.Millisecond * 100) // Устанавливаем ключ через 100 мс
+		dm.Set("key1", 10)
+	}()
+
+	tests := 10
+	interval := 20 // Проверяем каждые 20 мс
+	wg.Add(tests)
+
+	for i := 0; i < tests; i++ {
+		timeFromStart := interval * i // Вычисляем время перед запуском горутины
+		go func(i, timeFromStart int) {
+			defer wg.Done()
+			val, exists := dm.Get("key1")
+
+			if timeFromStart >= 50 {
+				if !exists || val != 10 {
+					t.Errorf("expected value 10, got %v", val)
+				}
+			} else {
+				if exists || val != 0 {
+					t.Errorf("expected no value, got %v", val)
+				}
+			}
+		}(i, timeFromStart)
+
+		time.Sleep(time.Millisecond * time.Duration(interval))
+	}
+
+	wg.Wait()
+}
+
+func TestDelayMap_MultipleInteractions(t *testing.T) {
+	dm := delaymap.New[string, int](time.Millisecond * 100)
+
+	// Set multiple keys
+	go func() {
+		time.Sleep(time.Millisecond * 50)
+		dm.Set("key1", 10)
+		dm.Set("key2", 20)
+		dm.Set("key3", 30)
+	}()
+
+	// Get multiple keys
+	val, exists := dm.Get("key1")
+	if !exists || val != 10 {
+		t.Errorf("expected value 10, got %v", val)
+	}
+
+	val, exists = dm.Get("key2")
+	if !exists || val != 20 {
+		t.Errorf("expected value 20, got %v", val)
+	}
+
+	val, exists = dm.Get("key3")
+	if !exists || val != 30 {
+		t.Errorf("expected value 30, got %v", val)
+	}
+
+	// Delete a key and check
+	dm.Delete("key2")
+	val, exists = dm.Get("key2")
+	if exists || val != 0 {
+		t.Errorf("expected value 0, got %v", val)
+	}
+
+	// Set a key after deletion
+	dm.Set("key2", 40)
+	val, exists = dm.Get("key2")
+	if !exists || val != 40 {
+		t.Errorf("expected value 40, got %v", val)
 	}
 }
